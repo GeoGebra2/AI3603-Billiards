@@ -16,6 +16,7 @@ import copy
 import os
 from datetime import datetime
 import random
+import json
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -323,18 +324,118 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
-    
-    def __init__(self):
-        pass
-    
+    def __init__(self, checkpoint: str = None, fast: bool = False, debug: bool = False):
+        super().__init__()
+        self.debug = bool(debug)
+        if fast:
+            self.k_targets = 2
+            self.v_candidates = [2.0, 3.0, 4.0]
+            self.theta_candidates = [0.0]
+            self.dphi_candidates = [-4.0, 0.0, 4.0]
+            self.offsets = [0.0, 0.02]
+            self.refine_dphi = [0.0]
+            self.refine_dv = [0.0]
+            self.refine_offsets = [0.0]
+        else:
+            self.k_targets = 3
+            self.v_candidates = [1.8, 2.4, 3.0, 3.8, 4.6]
+            self.theta_candidates = [0.0]
+            self.dphi_candidates = [-8.0, -4.0, 0.0, 4.0, 8.0]
+            self.offsets = [0.0, 0.02, -0.02]
+            self.refine_dphi = [-2.0, 0.0, 2.0]
+            self.refine_dv = [-0.6, 0.0, 0.6]
+            self.refine_offsets = [0.0, 0.01, -0.01]
+        if checkpoint is None:
+            default_path = os.path.join('eval', 'checkpoints', 'newagent_config.json')
+            checkpoint = default_path if os.path.exists(default_path) else None
+        if checkpoint is not None and os.path.isfile(checkpoint):
+            try:
+                with open(checkpoint, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                self.k_targets = int(cfg.get('k_targets', self.k_targets))
+                self.v_candidates = list(cfg.get('v_candidates', self.v_candidates))
+                self.theta_candidates = list(cfg.get('theta_candidates', self.theta_candidates))
+                self.dphi_candidates = list(cfg.get('dphi_candidates', self.dphi_candidates))
+                self.offsets = list(cfg.get('offsets', self.offsets))
+                self.refine_dphi = list(cfg.get('refine_dphi', self.refine_dphi))
+                self.refine_dv = list(cfg.get('refine_dv', self.refine_dv))
+                self.refine_offsets = list(cfg.get('refine_offsets', self.refine_offsets))
+            except Exception:
+                pass
+
     def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
-        
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
-        """
-        return self._random_action()
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
+        if len(remaining) == 0:
+            my_targets = ["8"]
+            remaining = ["8"]
+        cue_pos = balls['cue'].state.rvw[0][0:2]
+
+        def ang(a, b):
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            return float((math.degrees(math.atan2(dy, dx)) % 360))
+
+        targets_sorted = sorted(remaining, key=lambda bid: np.linalg.norm(balls[bid].state.rvw[0][0:2] - cue_pos))
+        targets_sorted = targets_sorted[:self.k_targets]
+
+        best = None
+        best_score = -1e9
+        total_sims = max(1, len(targets_sorted) * len(self.dphi_candidates) * len(self.v_candidates) * len(self.theta_candidates) * (len(self.offsets) ** 2))
+        done_sims = 0
+
+        for bid in targets_sorted:
+            tpos = balls[bid].state.rvw[0][0:2]
+            base_phi = ang(cue_pos, tpos)
+            for dphi in self.dphi_candidates:
+                phi = (base_phi + dphi) % 360
+                for V0 in self.v_candidates:
+                    for theta in self.theta_candidates:
+                        for a in self.offsets:
+                            for b in self.offsets:
+                                sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+                                sim_table = copy.deepcopy(table)
+                                cue = pt.Cue(cue_ball_id="cue")
+                                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                                try:
+                                    shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
+                                    pt.simulate(shot, inplace=True)
+                                except Exception:
+                                    continue
+                                score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                                if score > best_score:
+                                    best_score = score
+                                    best = {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
+                                done_sims += 1
+                                if self.debug and (done_sims % max(1, total_sims // 10) == 0):
+                                    print(f"[NewAgent] 粗搜进度 {done_sims}/{total_sims}, 当前最佳分 {best_score:.1f}")
+
+        if best is not None:
+            center = best
+            for dphi in self.refine_dphi:
+                phi = (center['phi'] + dphi) % 360
+                for dv in self.refine_dv:
+                    V0 = float(np.clip(center['V0'] + dv, 0.5, 8.0))
+                    for a in self.refine_offsets:
+                        for b in self.refine_offsets:
+                            sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+                            sim_table = copy.deepcopy(table)
+                            cue = pt.Cue(cue_ball_id="cue")
+                            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                            try:
+                                shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(center['theta']), a=float(a), b=float(b))
+                                pt.simulate(shot, inplace=True)
+                            except Exception:
+                                continue
+                            score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                            if score > best_score:
+                                best_score = score
+                                best = {'V0': float(V0), 'phi': float(phi), 'theta': float(center['theta']), 'a': float(a), 'b': float(b)}
+                            if self.debug:
+                                print(f"[NewAgent] 微调评分 {score:.1f} 最佳 {best_score:.1f}")
+
+        if best is None or best_score < 0:
+            return self._random_action()
+        return best
