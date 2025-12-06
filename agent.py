@@ -328,11 +328,11 @@ class NewAgent(Agent):
         super().__init__()
         self.debug = bool(debug)
         if fast:
-            self.k_targets = 2
-            self.v_candidates = [2.0, 3.0, 4.0]
+            self.k_targets = 1
+            self.v_candidates = [2.6, 3.2]
             self.theta_candidates = [0.0]
-            self.dphi_candidates = [-4.0, 0.0, 4.0]
-            self.offsets = [0.0, 0.02]
+            self.dphi_candidates = [-2.0, 0.0, 2.0]
+            self.offsets = [0.0]
             self.refine_dphi = [0.0]
             self.refine_dv = [0.0]
             self.refine_offsets = [0.0]
@@ -345,6 +345,15 @@ class NewAgent(Agent):
             self.refine_dphi = [-2.0, 0.0, 2.0]
             self.refine_dv = [-0.6, 0.0, 0.6]
             self.refine_offsets = [0.0, 0.01, -0.01]
+        self.use_pocket_aiming = False
+        self.occlusion_filter = False
+        self.robust_samples = 0
+        self.early_stop_score = None
+        self.robust_noise_std = {'V0': 0.1, 'phi': 0.1, 'theta': 0.1, 'a': 0.003, 'b': 0.003}
+        self.stats_occluded_target_count = 0
+        self.stats_occluded_pocket_count = 0
+        self.stats_total_sims = 0
+        self.stats_best_next_reach = 0
         if checkpoint is None:
             default_path = os.path.join('eval', 'checkpoints', 'newagent_config.json')
             checkpoint = default_path if os.path.exists(default_path) else None
@@ -360,6 +369,10 @@ class NewAgent(Agent):
                 self.refine_dphi = list(cfg.get('refine_dphi', self.refine_dphi))
                 self.refine_dv = list(cfg.get('refine_dv', self.refine_dv))
                 self.refine_offsets = list(cfg.get('refine_offsets', self.refine_offsets))
+                self.use_pocket_aiming = bool(cfg.get('use_pocket_aiming', self.use_pocket_aiming))
+                self.occlusion_filter = bool(cfg.get('occlusion_filter', self.occlusion_filter))
+                self.robust_samples = int(cfg.get('robust_samples', self.robust_samples))
+                self.early_stop_score = cfg.get('early_stop_score', self.early_stop_score)
             except Exception:
                 pass
 
@@ -378,7 +391,81 @@ class NewAgent(Agent):
             dy = b[1] - a[1]
             return float((math.degrees(math.atan2(dy, dx)) % 360))
 
-        targets_sorted = sorted(remaining, key=lambda bid: np.linalg.norm(balls[bid].state.rvw[0][0:2] - cue_pos))
+        def dist_point_to_segment(p, a, b):
+            ap = p - a
+            ab = b - a
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-9:
+                return float(np.linalg.norm(ap))
+            t = float(np.dot(ap, ab) / denom)
+            t = max(0.0, min(1.0, t))
+            closest = a + t * ab
+            return float(np.linalg.norm(p - closest))
+
+        def dist_and_t(p, a, b):
+            ap = p - a
+            ab = b - a
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-9:
+                return float(np.linalg.norm(ap)), 0.0
+            t = float(np.dot(ap, ab) / denom)
+            t = max(0.0, min(1.0, t))
+            closest = a + t * ab
+            return float(np.linalg.norm(p - closest)), t
+
+        def occluded(a, b):
+            thresh = 0.02
+            for k, ball in balls.items():
+                if k in ['cue'] or balls[k].state.s == 4:
+                    continue
+                pos = ball.state.rvw[0][0:2]
+                d, t = dist_and_t(pos, a, b)
+                if d < thresh and 0.1 < t < 0.9:
+                    return True
+            return False
+
+        def occluded_tp(t, p, ignore_ids=None):
+            thresh = 0.02
+            for k, ball in balls.items():
+                if ignore_ids and k in ignore_ids:
+                    continue
+                if balls[k].state.s == 4:
+                    continue
+                pos = ball.state.rvw[0][0:2]
+                d, tt = dist_and_t(pos, t, p)
+                if d < thresh and 0.1 < tt < 0.9:
+                    return True
+            return False
+
+        def ghost_phi(cue, target, pocket):
+            v = pocket - target
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                return ang(cue, target)
+            u = v / n
+            d = 0.057
+            ghost = target - u * d
+            return ang(cue, ghost)
+
+        def pocketability(bid):
+            tpos = balls[bid].state.rvw[0][0:2]
+            score = 0.0
+            if hasattr(table, 'pockets') and isinstance(table.pockets, dict):
+                unblocked = 0
+                min_dist = 1e9
+                for pk in table.pockets:
+                    ppos = table.pockets[pk].center[0:2]
+                    dpk = float(np.linalg.norm(ppos - tpos))
+                    if dpk < min_dist:
+                        min_dist = dpk
+                    if not (self.occlusion_filter and occluded_tp(tpos, ppos, ignore_ids=[bid, 'cue'])):
+                        unblocked += 1
+                score = float(unblocked * 100.0 - min_dist)
+            else:
+                score = -float(np.linalg.norm(tpos - cue_pos))
+            return score
+
+        targets_sorted = sorted(remaining, key=lambda bid: ( -pocketability(bid), np.linalg.norm(balls[bid].state.rvw[0][0:2] - cue_pos) ))
         targets_sorted = targets_sorted[:self.k_targets]
 
         best = None
@@ -388,9 +475,38 @@ class NewAgent(Agent):
 
         for bid in targets_sorted:
             tpos = balls[bid].state.rvw[0][0:2]
-            base_phi = ang(cue_pos, tpos)
-            for dphi in self.dphi_candidates:
-                phi = (base_phi + dphi) % 360
+            phi_candidates = []
+            if self.use_pocket_aiming and hasattr(table, 'pockets') and isinstance(table.pockets, dict):
+                blocked_all = True
+                nearest_pk = None
+                nearest_dist = 1e9
+                for pk in table.pockets:
+                    ppos = table.pockets[pk].center[0:2]
+                    dpk = float(np.linalg.norm(ppos - tpos))
+                    if dpk < nearest_dist:
+                        nearest_dist = dpk
+                        nearest_pk = pk
+                    if self.occlusion_filter and occluded_tp(tpos, ppos, ignore_ids=[bid, 'cue']):
+                        self.stats_occluded_pocket_count += 1
+                        continue
+                    blocked_all = False
+                    phi_p = ghost_phi(cue_pos, tpos, ppos)
+                    for dphi in self.dphi_candidates:
+                        phi_candidates.append((phi_p + dphi) % 360)
+                if blocked_all and nearest_pk is not None:
+                    ppos = table.pockets[nearest_pk].center[0:2]
+                    phi_p = ghost_phi(cue_pos, tpos, ppos)
+                    for dphi in self.dphi_candidates:
+                        phi_candidates.append((phi_p + dphi) % 360)
+            else:
+                base_phi = ang(cue_pos, tpos)
+                for dphi in self.dphi_candidates:
+                    phi_candidates.append((base_phi + dphi) % 360)
+            if self.occlusion_filter:
+                if occluded(cue_pos, tpos):
+                    self.stats_occluded_target_count += 1
+                    continue
+            for phi in phi_candidates:
                 for V0 in self.v_candidates:
                     for theta in self.theta_candidates:
                         for a in self.offsets:
@@ -400,42 +516,163 @@ class NewAgent(Agent):
                                 cue = pt.Cue(cue_ball_id="cue")
                                 shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
                                 try:
-                                    shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
-                                    pt.simulate(shot, inplace=True)
+                                    if self.robust_samples and self.robust_samples > 0:
+                                        rs = []
+                                        for _ in range(self.robust_samples):
+                                            V0n = float(np.clip(V0 + np.random.normal(0, self.robust_noise_std['V0']), 0.5, 8.0))
+                                            phin = float((phi + np.random.normal(0, self.robust_noise_std['phi'])) % 360)
+                                            thetan = float(np.clip(theta + np.random.normal(0, self.robust_noise_std['theta']), 0, 90))
+                                            an = float(np.clip(a + np.random.normal(0, self.robust_noise_std['a']), -0.5, 0.5))
+                                            bn = float(np.clip(b + np.random.normal(0, self.robust_noise_std['b']), -0.5, 0.5))
+                                            shot.cue.set_state(V0=V0n, phi=phin, theta=thetan, a=an, b=bn)
+                                            pt.simulate(shot, inplace=True)
+                                            sc = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                                            cue_new = shot.balls['cue'].state.rvw[0][0:2]
+                                            remain = [x for x in my_targets if shot.balls[x].state.s != 4]
+                                            reach = 0
+                                            for x in remain:
+                                                t2 = shot.balls[x].state.rvw[0][0:2]
+                                                if not occluded(cue_new, t2):
+                                                    reach += 1
+                                            sc += float(min(3, reach) * 8.0)
+                                            rs.append(sc)
+                                        score = float(np.mean(rs))
+                                    else:
+                                        shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
+                                        pt.simulate(shot, inplace=True)
+                                        score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                                        cue_new = shot.balls['cue'].state.rvw[0][0:2]
+                                        remain = [x for x in my_targets if shot.balls[x].state.s != 4]
+                                        reach = 0
+                                        for x in remain:
+                                            t2 = shot.balls[x].state.rvw[0][0:2]
+                                            if not occluded(cue_new, t2):
+                                                reach += 1
+                                        score += float(min(3, reach) * 8.0)
+                                        hit_cushion = False
+                                        for e in shot.events:
+                                            et = str(e.event_type).lower()
+                                            if 'cushion' in et:
+                                                hit_cushion = True
+                                                break
+                                        if hit_cushion and score <= 10:
+                                            score += 12.0
                                 except Exception:
                                     continue
-                                score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
                                 if score > best_score:
                                     best_score = score
                                     best = {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
                                 done_sims += 1
                                 if self.debug and (done_sims % max(1, total_sims // 10) == 0):
                                     print(f"[NewAgent] 粗搜进度 {done_sims}/{total_sims}, 当前最佳分 {best_score:.1f}")
+                                if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                                    break
+                        if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                            break
+                    if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                        break
+                if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                    break
+
+        if best is None:
+            safe_phis = [30.0, 90.0, 150.0, 210.0, 270.0, 330.0]
+            for phi in safe_phis:
+                V0 = 2.5
+                theta = 0.0
+                a = 0.0
+                b = 0.0
+                sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+                sim_table = copy.deepcopy(table)
+                cue = pt.Cue(cue_ball_id="cue")
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                try:
+                    shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
+                    pt.simulate(shot, inplace=True)
+                except Exception:
+                    continue
+                score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                cue_new = shot.balls['cue'].state.rvw[0][0:2]
+                remain = [x for x in my_targets if shot.balls[x].state.s != 4]
+                reach = 0
+                for x in remain:
+                    t2 = shot.balls[x].state.rvw[0][0:2]
+                    if not occluded(cue_new, t2):
+                        reach += 1
+                score += float(min(3, reach) * 8.0)
+                hit_cushion = False
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    if 'cushion' in et:
+                        hit_cushion = True
+                        break
+                if hit_cushion and score <= 10:
+                    score += 12.0
+                if score > best_score:
+                    best_score = score
+                    best = {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
+                done_sims += 1
 
         if best is not None:
-            center = best
-            for dphi in self.refine_dphi:
-                phi = (center['phi'] + dphi) % 360
-                for dv in self.refine_dv:
-                    V0 = float(np.clip(center['V0'] + dv, 0.5, 8.0))
-                    for a in self.refine_offsets:
-                        for b in self.refine_offsets:
-                            sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
-                            sim_table = copy.deepcopy(table)
-                            cue = pt.Cue(cue_ball_id="cue")
-                            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-                            try:
-                                shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(center['theta']), a=float(a), b=float(b))
-                                pt.simulate(shot, inplace=True)
-                            except Exception:
-                                continue
-                            score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
-                            if score > best_score:
-                                best_score = score
-                                best = {'V0': float(V0), 'phi': float(phi), 'theta': float(center['theta']), 'a': float(a), 'b': float(b)}
-                            if self.debug:
-                                print(f"[NewAgent] 微调评分 {score:.1f} 最佳 {best_score:.1f}")
+            top_candidates = [best]
+            center_list = top_candidates
+            for center in center_list:
+                for dphi in self.refine_dphi:
+                    phi = (center['phi'] + dphi) % 360
+                    for dv in self.refine_dv:
+                        V0 = float(np.clip(center['V0'] + dv, 0.5, 8.0))
+                        for a in self.refine_offsets:
+                            for b in self.refine_offsets:
+                                sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+                                sim_table = copy.deepcopy(table)
+                                cue = pt.Cue(cue_ball_id="cue")
+                                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                                try:
+                                    shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(center['theta']), a=float(a), b=float(b))
+                                    pt.simulate(shot, inplace=True)
+                                except Exception:
+                                    continue
+                                score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
+                                cue_new = shot.balls['cue'].state.rvw[0][0:2]
+                                remain = [x for x in my_targets if shot.balls[x].state.s != 4]
+                                reach = 0
+                                for x in remain:
+                                    t2 = shot.balls[x].state.rvw[0][0:2]
+                                    if not occluded(cue_new, t2):
+                                        reach += 1
+                                score += float(min(3, reach) * 8.0)
+                                if score > best_score:
+                                    best_score = score
+                                    best = {'V0': float(V0), 'phi': float(phi), 'theta': float(center['theta']), 'a': float(a), 'b': float(b)}
+                                if self.debug:
+                                    print(f"[NewAgent] 微调评分 {score:.1f} 最佳 {best_score:.1f}")
+                                if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                                    break
+                            if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                                break
+                        if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                            break
+                    if self.early_stop_score is not None and best_score >= float(self.early_stop_score):
+                        break
+
+        self.stats_total_sims = int(done_sims)
 
         if best is None or best_score < 0:
             return self._random_action()
+        try:
+            sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
+            sim_table = copy.deepcopy(table)
+            cue = pt.Cue(cue_ball_id="cue")
+            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            shot.cue.set_state(V0=float(best['V0']), phi=float(best['phi']), theta=float(best['theta']), a=float(best['a']), b=float(best['b']))
+            pt.simulate(shot, inplace=True)
+            cue_new = shot.balls['cue'].state.rvw[0][0:2]
+            remain = [x for x in my_targets if shot.balls[x].state.s != 4]
+            reach = 0
+            for x in remain:
+                t2 = shot.balls[x].state.rvw[0][0:2]
+                if not occluded(cue_new, t2):
+                    reach += 1
+            self.stats_best_next_reach = int(reach)
+        except Exception:
+            self.stats_best_next_reach = 0
         return best

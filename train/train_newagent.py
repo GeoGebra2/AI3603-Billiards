@@ -19,8 +19,8 @@ from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 
-def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False):
-    agent = NewAgent(checkpoint=None, fast=True, debug=verbose)
+def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fast=False):
+    agent = NewAgent(checkpoint=None, fast=fast, debug=verbose)
     agent.k_targets = int(cfg['k_targets'])
     agent.v_candidates = list(cfg['v_candidates'])
     agent.theta_candidates = list(cfg['theta_candidates'])
@@ -29,6 +29,10 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False):
     agent.refine_dphi = list(cfg['refine_dphi'])
     agent.refine_dv = list(cfg['refine_dv'])
     agent.refine_offsets = list(cfg['refine_offsets'])
+    agent.use_pocket_aiming = bool(cfg.get('use_pocket_aiming', False))
+    agent.occlusion_filter = bool(cfg.get('occlusion_filter', False))
+    agent.robust_samples = int(cfg.get('robust_samples', 0))
+    agent.early_stop_score = cfg.get('early_stop_score', None)
     total = 0.0
     trial_iter = range(n_trials)
     trial_iter = tqdm(trial_iter, desc=f"config {config_idx} trials", leave=False)
@@ -54,8 +58,12 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False):
         elif info.get('BLACK_BALL_INTO_POCKET'):
             remaining = [bid for bid in my_targets if env.balls[bid].state.s != 4]
             reward += 100.0 if len(remaining) == 0 else -150.0
-        reward += len(info.get('ME_INTO_POCKET', [])) * 50.0
-        reward -= len(info.get('ENEMY_INTO_POCKET', [])) * 20.0
+        if info.get('NO_POCKET_NO_RAIL'):
+            reward -= 20.0
+        if info.get('NO_HIT'):
+            reward -= 30.0
+        reward += len(info.get('ME_INTO_POCKET', [])) * 60.0
+        reward -= len(info.get('ENEMY_INTO_POCKET', [])) * 25.0
         total += reward
         t_trial = time.time() - t0
         if verbose:
@@ -69,14 +77,24 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False):
             writer.add_scalar(f'config_{config_idx}/trial_reward', reward, i)
             writer.add_scalar(f'config_{config_idx}/decision_time_s', t_decision, i)
             writer.add_scalar(f'config_{config_idx}/trial_time_s', t_trial, i)
+            writer.add_scalar(f'config_{config_idx}/foul_white_pocket', 1 if info.get('WHITE_BALL_INTO_POCKET') else 0, i)
+            writer.add_scalar(f'config_{config_idx}/foul_no_pocket_no_rail', 1 if info.get('NO_POCKET_NO_RAIL') else 0, i)
+            writer.add_scalar(f'config_{config_idx}/foul_first_hit_opponent', 1 if info.get('FOUL_FIRST_HIT') else 0, i)
+            writer.add_scalar(f'config_{config_idx}/me_pocket_count', len(info.get('ME_INTO_POCKET', [])), i)
+            writer.add_scalar(f'config_{config_idx}/enemy_pocket_count', len(info.get('ENEMY_INTO_POCKET', [])), i)
+            writer.add_scalar(f'config_{config_idx}/black_pocket', 1 if info.get('BLACK_BALL_INTO_POCKET') else 0, i)
+            writer.add_scalar(f'config_{config_idx}/next_shot_reach', getattr(agent, 'stats_best_next_reach', 0), i)
+            writer.add_scalar(f'config_{config_idx}/occluded_filtered_target', getattr(agent, 'stats_occluded_target_count', 0), i)
+            writer.add_scalar(f'config_{config_idx}/occluded_filtered_pocket', getattr(agent, 'stats_occluded_pocket_count', 0), i)
+            writer.add_scalar(f'config_{config_idx}/sims_total', getattr(agent, 'stats_total_sims', 0), i)
     return total / float(max(1, n_trials))
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--episodes', type=int, default=5)
+    parser.add_argument('--episodes', type=int, default=20)
     parser.add_argument('--out', type=str, default=os.path.join('eval', 'checkpoints', 'newagent_config.json'))
     parser.add_argument('--logdir', type=str, default=os.path.join('train', 'runs', 'newagent'))
-    parser.add_argument('--fast', action='store_true', default=True)
+    parser.add_argument('--fast', action='store_true', default=False)
     parser.add_argument('--verbose', action='store_true', default=False)
     args = parser.parse_args()
     random.seed(42)
@@ -87,24 +105,46 @@ def main():
     writer = SummaryWriter(log_dir=run_dir)
     search_space = [
         {
-            'k_targets': 3,
-            'v_candidates': [1.8, 2.4, 3.0, 3.8, 4.6],
+            'k_targets': 2,
+            'v_candidates': [2.2, 3.0, 3.8],
             'theta_candidates': [0.0],
-            'dphi_candidates': [-8.0, -4.0, 0.0, 4.0, 8.0],
-            'offsets': [0.0, 0.02, -0.02],
-            'refine_dphi': [-2.0, 0.0, 2.0],
-            'refine_dv': [-0.6, 0.0, 0.6],
-            'refine_offsets': [0.0, 0.01, -0.01]
+            'dphi_candidates': [-2.0, 0.0, 2.0],
+            'offsets': [-0.02, 0.0, 0.02],
+            'refine_dphi': [-1.0, 0.0, 1.0],
+            'refine_dv': [0.0],
+            'refine_offsets': [-0.015, 0.0, 0.015],
+            'use_pocket_aiming': True,
+            'occlusion_filter': True,
+            'robust_samples': 5,
+            'early_stop_score': 40.0
+        },
+        {
+            'k_targets': 1,
+            'v_candidates': [2.2, 3.0, 3.8],
+            'theta_candidates': [0.0],
+            'dphi_candidates': [-2.0, 0.0, 2.0],
+            'offsets': [-0.02, 0.0, 0.02],
+            'refine_dphi': [-1.0, 0.0, 1.0],
+            'refine_dv': [0.0],
+            'refine_offsets': [-0.015, 0.0, 0.015],
+            'use_pocket_aiming': True,
+            'occlusion_filter': True,
+            'robust_samples': 5,
+            'early_stop_score': 40.0
         },
         {
             'k_targets': 2,
-            'v_candidates': [2.0, 2.8, 3.6, 4.4],
+            'v_candidates': [2.6, 3.4],
             'theta_candidates': [0.0],
-            'dphi_candidates': [-6.0, -3.0, 0.0, 3.0, 6.0],
-            'offsets': [0.0, 0.015, -0.015],
-            'refine_dphi': [-1.5, 0.0, 1.5],
-            'refine_dv': [-0.5, 0.0, 0.5],
-            'refine_offsets': [0.0, 0.008, -0.008]
+            'dphi_candidates': [-4.0, 0.0, 4.0],
+            'offsets': [0.0],
+            'refine_dphi': [0.0],
+            'refine_dv': [0.0],
+            'refine_offsets': [0.0],
+            'use_pocket_aiming': False,
+            'occlusion_filter': True,
+            'robust_samples': 0,
+            'early_stop_score': 30.0
         }
     ]
     best_cfg = None
@@ -112,7 +152,7 @@ def main():
     outer_iter = enumerate(search_space)
     outer_iter = tqdm(list(outer_iter), desc='configs', leave=True)
     for idx_cfg, cfg in outer_iter:
-        score = eval_config(env, cfg, n_trials=args.episodes, writer=writer, config_idx=idx_cfg, verbose=args.verbose)
+        score = eval_config(env, cfg, n_trials=args.episodes, writer=writer, config_idx=idx_cfg, verbose=args.verbose, fast=args.fast)
         if score > best_score:
             best_score = score
             best_cfg = cfg
