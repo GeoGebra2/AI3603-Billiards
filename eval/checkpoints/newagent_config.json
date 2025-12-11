@@ -1,31 +1,17 @@
 {
-  "k_targets": 2,
+  "k_targets": 1,
   "v_candidates": [
-    2.6,
     3.4
   ],
   "theta_candidates": [
     0.0
   ],
   "dphi_candidates": [
-    -4.0,
-    0.0,
-    4.0
+    0.0
   ],
   "offsets": [
     0.0
   ],
-  "refine_dphi": [
-    0.0
-  ],
-  "refine_dv": [
-    0.0
-  ],
-  "refine_offsets": [
-    0.0
-  ],
-  "use_pocket_aiming": false,
-  "occlusion_filter": true,
   "robust_samples": 0,
-  "early_stop_score": 30.0
+  "lambda_future": 0.0
 }

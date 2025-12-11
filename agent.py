@@ -9,7 +9,9 @@ agent.py - Agent 决策模块
 """
 
 import math
-import pooltool as pt
+from pooltool.system.datatypes import System
+from pooltool.objects import Cue
+from pooltool.evolution import simulate
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
 import copy
@@ -25,7 +27,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
 
 
-def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
+def analyze_shot_for_reward(shot: System, last_state: dict, player_targets: list):
     """
     分析击球结果并计算奖励分数
     
@@ -71,8 +73,12 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
         if ('8' not in opponent_plus_eight):
             opponent_plus_eight.append('8')
             
-        if len(remaining_own_before) > 0 and first_contact_ball_id in opponent_plus_eight:
-            foul_first_hit = True
+        if len(remaining_own_before) > 0:
+            if first_contact_ball_id in opponent_plus_eight:
+                foul_first_hit = True
+        else:
+            if first_contact_ball_id != '8':
+                foul_first_hit = True
     
     # 3. 分析碰库
     cue_hit_cushion = False
@@ -250,9 +256,9 @@ class BasicAgent(Agent):
                 # 创建一个用于模拟的沙盒系统
                 sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
                 sim_table = copy.deepcopy(table)
-                cue = pt.Cue(cue_ball_id="cue")
+                cue = Cue(cue_ball_id="cue")
 
-                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                shot = System(table=sim_table, balls=sim_balls, cue=cue)
                 
                 try:
                     if self.enable_noise:
@@ -273,7 +279,7 @@ class BasicAgent(Agent):
                         shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                     
                     # 关键：使用 pooltool 物理引擎 (世界A)
-                    pt.simulate(shot, inplace=True)
+                    simulate(shot, inplace=True)
                 except Exception as e:
                     # 模拟失败，给予极大惩罚
                     return -500
@@ -349,7 +355,7 @@ class NewAgent(Agent):
         self.occlusion_filter = False
         self.robust_samples = 0
         self.early_stop_score = None
-        self.robust_noise_std = {'V0': 0.1, 'phi': 0.1, 'theta': 0.1, 'a': 0.003, 'b': 0.003}
+        self.robust_noise_std = {'V0': 0.08, 'phi': 0.05, 'theta': 0.05, 'a': 0.002, 'b': 0.002}
         self.stats_occluded_target_count = 0
         self.stats_occluded_pocket_count = 0
         self.stats_total_sims = 0
@@ -414,7 +420,7 @@ class NewAgent(Agent):
             return float(np.linalg.norm(p - closest)), t
 
         def occluded(a, b):
-            thresh = 0.02
+            thresh = 0.015
             for k, ball in balls.items():
                 if k in ['cue'] or balls[k].state.s == 4:
                     continue
@@ -425,7 +431,7 @@ class NewAgent(Agent):
             return False
 
         def occluded_tp(t, p, ignore_ids=None):
-            thresh = 0.02
+            thresh = 0.015
             for k, ball in balls.items():
                 if ignore_ids and k in ignore_ids:
                     continue
@@ -513,8 +519,8 @@ class NewAgent(Agent):
                             for b in self.offsets:
                                 sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
                                 sim_table = copy.deepcopy(table)
-                                cue = pt.Cue(cue_ball_id="cue")
-                                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                                cue = Cue(cue_ball_id="cue")
+                                shot = System(table=sim_table, balls=sim_balls, cue=cue)
                                 try:
                                     if self.robust_samples and self.robust_samples > 0:
                                         rs = []
@@ -525,7 +531,7 @@ class NewAgent(Agent):
                                             an = float(np.clip(a + np.random.normal(0, self.robust_noise_std['a']), -0.5, 0.5))
                                             bn = float(np.clip(b + np.random.normal(0, self.robust_noise_std['b']), -0.5, 0.5))
                                             shot.cue.set_state(V0=V0n, phi=phin, theta=thetan, a=an, b=bn)
-                                            pt.simulate(shot, inplace=True)
+                                            simulate(shot, inplace=True)
                                             sc = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
                                             cue_new = shot.balls['cue'].state.rvw[0][0:2]
                                             remain = [x for x in my_targets if shot.balls[x].state.s != 4]
@@ -539,7 +545,7 @@ class NewAgent(Agent):
                                         score = float(np.mean(rs))
                                     else:
                                         shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
-                                        pt.simulate(shot, inplace=True)
+                                        simulate(shot, inplace=True)
                                         score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
                                         cue_new = shot.balls['cue'].state.rvw[0][0:2]
                                         remain = [x for x in my_targets if shot.balls[x].state.s != 4]
@@ -577,17 +583,17 @@ class NewAgent(Agent):
         if best is None:
             safe_phis = [30.0, 90.0, 150.0, 210.0, 270.0, 330.0]
             for phi in safe_phis:
-                V0 = 2.5
+                V0 = 3.0
                 theta = 0.0
                 a = 0.0
                 b = 0.0
                 sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
                 sim_table = copy.deepcopy(table)
-                cue = pt.Cue(cue_ball_id="cue")
-                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                cue = Cue(cue_ball_id="cue")
+                shot = System(table=sim_table, balls=sim_balls, cue=cue)
                 try:
                     shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
-                    pt.simulate(shot, inplace=True)
+                    simulate(shot, inplace=True)
                 except Exception:
                     continue
                 score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
@@ -624,11 +630,11 @@ class NewAgent(Agent):
                             for b in self.refine_offsets:
                                 sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
                                 sim_table = copy.deepcopy(table)
-                                cue = pt.Cue(cue_ball_id="cue")
-                                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                                cue = Cue(cue_ball_id="cue")
+                                shot = System(table=sim_table, balls=sim_balls, cue=cue)
                                 try:
                                     shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(center['theta']), a=float(a), b=float(b))
-                                    pt.simulate(shot, inplace=True)
+                                    simulate(shot, inplace=True)
                                 except Exception:
                                     continue
                                 score = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets)
@@ -661,10 +667,55 @@ class NewAgent(Agent):
         try:
             sim_balls = {k: copy.deepcopy(v) for k, v in balls.items()}
             sim_table = copy.deepcopy(table)
-            cue = pt.Cue(cue_ball_id="cue")
-            shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+            cue = Cue(cue_ball_id="cue")
+            shot = System(table=sim_table, balls=sim_balls, cue=cue)
             shot.cue.set_state(V0=float(best['V0']), phi=float(best['phi']), theta=float(best['theta']), a=float(best['a']), b=float(best['b']))
-            pt.simulate(shot, inplace=True)
+            simulate(shot, inplace=True)
+            new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state_snapshot[bid].state.s != 4]
+            first_contact_ball_id = None
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, 'ids') else []
+                if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                    other_ids = [i for i in ids if i != 'cue']
+                    if other_ids:
+                        first_contact_ball_id = other_ids[0]
+                        break
+            cue_hit_cushion = False
+            target_hit_cushion = False
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, 'ids') else []
+                if 'cushion' in et:
+                    if 'cue' in ids:
+                        cue_hit_cushion = True
+                    if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                        target_hit_cushion = True
+            if (len(new_pocketed) == 0) and (first_contact_ball_id is not None) and (not cue_hit_cushion) and (not target_hit_cushion):
+                safe_phis = [30.0, 90.0, 150.0, 210.0, 270.0, 330.0]
+                replaced = False
+                for phi_s in safe_phis:
+                    sim_balls2 = {k: copy.deepcopy(v) for k, v in balls.items()}
+                    sim_table2 = copy.deepcopy(table)
+                    cue2 = Cue(cue_ball_id="cue")
+                    shot2 = System(table=sim_table2, balls=sim_balls2, cue=cue2)
+                    try:
+                        shot2.cue.set_state(V0=3.0, phi=phi_s, theta=0.0, a=0.0, b=0.0)
+                        simulate(shot2, inplace=True)
+                    except Exception:
+                        continue
+                    cue_hit_cushion2 = False
+                    for e in shot2.events:
+                        et = str(e.event_type).lower()
+                        ids = list(e.ids) if hasattr(e, 'ids') else []
+                        if 'cushion' in et and ('cue' in ids):
+                            cue_hit_cushion2 = True
+                            break
+                    new_pocketed2 = [bid for bid, b in shot2.balls.items() if b.state.s == 4 and last_state_snapshot[bid].state.s != 4]
+                    if cue_hit_cushion2 or len(new_pocketed2) > 0:
+                        best = {'V0': 3.0, 'phi': phi_s, 'theta': 0.0, 'a': 0.0, 'b': 0.0}
+                        shot = shot2
+                        break
             cue_new = shot.balls['cue'].state.rvw[0][0:2]
             remain = [x for x in my_targets if shot.balls[x].state.s != 4]
             reach = 0
@@ -675,4 +726,253 @@ class NewAgent(Agent):
             self.stats_best_next_reach = int(reach)
         except Exception:
             self.stats_best_next_reach = 0
+        return best
+
+class MCTSAgent(Agent):
+    def __init__(self, checkpoint: str = None):
+        super().__init__()
+        self.k_targets = 2
+        self.v_candidates = [2.6, 3.4]
+        self.theta_candidates = [0.0]
+        self.dphi_candidates = [-3.0, 0.0, 3.0]
+        self.offsets = [-0.01, 0.0, 0.01]
+        self.robust_samples = 3
+        self.robust_noise_std = {'V0': 0.08, 'phi': 0.06, 'theta': 0.04, 'a': 0.002, 'b': 0.002}
+        self.lambda_future = 0.4
+        self.stats_total_sims = 0
+        if checkpoint is None:
+            default_path = os.path.join('eval', 'checkpoints', 'newagent_config.json')
+            checkpoint = default_path if os.path.exists(default_path) else None
+        if checkpoint is not None and os.path.isfile(checkpoint):
+            try:
+                with open(checkpoint, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                if 'k_targets' in cfg:
+                    self.k_targets = int(cfg['k_targets'])
+                if 'v_candidates' in cfg:
+                    self.v_candidates = list(cfg['v_candidates'])
+                if 'theta_candidates' in cfg:
+                    self.theta_candidates = list(cfg['theta_candidates'])
+                if 'dphi_candidates' in cfg:
+                    self.dphi_candidates = list(cfg['dphi_candidates'])
+                if 'offsets' in cfg:
+                    self.offsets = list(cfg['offsets'])
+                if 'robust_samples' in cfg:
+                    self.robust_samples = int(cfg['robust_samples'])
+                if 'lambda_future' in cfg:
+                    self.lambda_future = float(cfg['lambda_future'])
+            except Exception:
+                pass
+
+    def decision(self, balls=None, my_targets=None, table=None):
+        if balls is None or my_targets is None or table is None:
+            return self._random_action()
+        last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
+        if len(remaining) == 0:
+            my_targets = ["8"]
+            remaining = ["8"]
+        cue_pos = balls['cue'].state.rvw[0][0:2]
+
+        def ang(a, b):
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            return float((math.degrees(math.atan2(dy, dx)) % 360))
+
+        def dist_and_t(p, a, b):
+            ap = p - a
+            ab = b - a
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-9:
+                return float(np.linalg.norm(ap)), 0.0
+            t = float(np.dot(ap, ab) / denom)
+            t = max(0.0, min(1.0, t))
+            closest = a + t * ab
+            return float(np.linalg.norm(p - closest)), t
+
+        def occluded(a, b, ignore_ids=None):
+            thresh = 0.015
+            for k, ball in balls.items():
+                if ignore_ids and k in ignore_ids:
+                    continue
+                if balls[k].state.s == 4:
+                    continue
+                pos = ball.state.rvw[0][0:2]
+                d, tt = dist_and_t(pos, a, b)
+                if d < thresh and 0.1 < tt < 0.9:
+                    return True
+            return False
+
+        def ghost_phi(cue, target, pocket):
+            v = pocket - target
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                return ang(cue, target)
+            u = v / n
+            d = 0.057
+            ghost = target - u * d
+            return ang(cue, ghost)
+
+        def reach_metric(shot, my_targets_now):
+            cue_new = shot.balls['cue'].state.rvw[0][0:2]
+            remain = [x for x in my_targets_now if shot.balls[x].state.s != 4]
+            r = 0
+            for x in remain:
+                t2 = shot.balls[x].state.rvw[0][0:2]
+                if not occluded(cue_new, t2, ignore_ids=['cue', x]):
+                    r += 1
+            return float(min(3, r))
+
+        def trial_score(V0, phi, theta, a, b, balls0, table0, my_targets_now):
+            sim_balls = {k: copy.deepcopy(v) for k, v in balls0.items()}
+            sim_table = copy.deepcopy(table0)
+            cue = Cue(cue_ball_id="cue")
+            shot = System(table=sim_table, balls=sim_balls, cue=cue)
+            try:
+                shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
+                simulate(shot, inplace=True)
+            except Exception:
+                return -1e9, None
+            base = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets_now)
+            r = reach_metric(shot, my_targets_now)
+            return float(base + r * 8.0), shot
+
+        def risk_penalty(V0, phi, theta, a, b, balls0, table0, my_targets_now):
+            bad = 0
+            total = max(1, int(self.robust_samples))
+            for _ in range(total):
+                V0n = float(np.clip(V0 + np.random.normal(0, self.robust_noise_std['V0']), 0.5, 8.0))
+                phin = float((phi + np.random.normal(0, self.robust_noise_std['phi'])) % 360)
+                thetan = float(np.clip(theta + np.random.normal(0, self.robust_noise_std['theta']), 0, 90))
+                an = float(np.clip(a + np.random.normal(0, self.robust_noise_std['a']), -0.5, 0.5))
+                bn = float(np.clip(b + np.random.normal(0, self.robust_noise_std['b']), -0.5, 0.5))
+                sim_balls = {k: copy.deepcopy(v) for k, v in balls0.items()}
+                sim_table = copy.deepcopy(table0)
+                cue = Cue(cue_ball_id="cue")
+                shot = System(table=sim_table, balls=sim_balls, cue=cue)
+                try:
+                    shot.cue.set_state(V0=V0n, phi=phin, theta=thetan, a=an, b=bn)
+                    simulate(shot, inplace=True)
+                except Exception:
+                    bad += 1
+                    continue
+                new_pocketed = [bid for bid, bbb in shot.balls.items() if bbb.state.s == 4 and last_state_snapshot[bid].state.s != 4]
+                foul_first_hit = False
+                first_contact_ball_id = None
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+                        other_ids = [i for i in ids if i != 'cue']
+                        if other_ids:
+                            first_contact_ball_id = other_ids[0]
+                            break
+                if first_contact_ball_id is None:
+                    if len(last_state_snapshot) > 2:
+                        foul_first_hit = True
+                else:
+                    remaining_own_before = [bid for bid in my_targets_now if last_state_snapshot[bid].state.s != 4]
+                    opponent_plus_eight = [bid for bid in last_state_snapshot.keys() if bid not in my_targets_now and bid not in ['cue']]
+                    if ('8' not in opponent_plus_eight):
+                        opponent_plus_eight.append('8')
+                    if len(remaining_own_before) > 0:
+                        if first_contact_ball_id in opponent_plus_eight:
+                            foul_first_hit = True
+                    else:
+                        if first_contact_ball_id != '8':
+                            foul_first_hit = True
+                foul_no_rail = False
+                cue_hit_cushion = False
+                target_hit_cushion = False
+                for e in shot.events:
+                    et = str(e.event_type).lower()
+                    ids = list(e.ids) if hasattr(e, 'ids') else []
+                    if 'cushion' in et:
+                        if 'cue' in ids:
+                            cue_hit_cushion = True
+                        if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                            target_hit_cushion = True
+                if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+                    foul_no_rail = True
+                if ('cue' in new_pocketed) or foul_first_hit or foul_no_rail:
+                    bad += 1
+            return float(bad) / float(total)
+
+        targets_sorted = sorted(remaining, key=lambda bid: np.linalg.norm(balls[bid].state.rvw[0][0:2] - cue_pos))
+        targets_sorted = targets_sorted[:self.k_targets]
+        candidates = []
+        for bid in targets_sorted:
+            tpos = balls[bid].state.rvw[0][0:2]
+            pocket_phis = []
+            if hasattr(table, 'pockets') and isinstance(table.pockets, dict):
+                for pk in table.pockets:
+                    ppos = table.pockets[pk].center[0:2]
+                    if not occluded(tpos, ppos, ignore_ids=[bid, 'cue']):
+                        pocket_phis.append(ghost_phi(cue_pos, tpos, ppos))
+            if not pocket_phis:
+                pocket_phis.append(ang(cue_pos, tpos))
+            for phi0 in pocket_phis:
+                for dphi in self.dphi_candidates:
+                    phi = (phi0 + dphi) % 360
+                    for V0 in self.v_candidates:
+                        for theta in self.theta_candidates:
+                            for a in self.offsets:
+                                for b in self.offsets:
+                                    candidates.append((V0, phi, theta, a, b))
+
+        best = None
+        best_score = -1e9
+        sims = 0
+        for V0, phi, theta, a, b in candidates:
+            rp = risk_penalty(V0, phi, theta, a, b, balls, table, my_targets)
+            if rp >= 0.67:
+                continue
+            s1, shot1 = trial_score(V0, phi, theta, a, b, balls, table, my_targets)
+            if shot1 is None:
+                continue
+            my_next = my_targets
+            s2 = 0.0
+            cue_next = shot1.balls['cue'].state.rvw[0][0:2]
+            remain_next = [x for x in my_next if shot1.balls[x].state.s != 4]
+            if len(remain_next) == 0:
+                remain_next = ["8"]
+            if hasattr(table, 'pockets') and isinstance(table.pockets, dict):
+                for x in remain_next[:1]:
+                    tpos2 = shot1.balls[x].state.rvw[0][0:2]
+                    pk2 = None
+                    mind = 1e9
+                    for pk in table.pockets:
+                        ppos = table.pockets[pk].center[0:2]
+                        dpk = float(np.linalg.norm(ppos - tpos2))
+                        if dpk < mind and not occluded(tpos2, ppos, ignore_ids=[x, 'cue']):
+                            mind = dpk
+                            pk2 = pk
+                    if pk2 is not None:
+                        phi2 = ghost_phi(cue_next, tpos2, table.pockets[pk2].center[0:2])
+                        s2, _ = trial_score(3.0, phi2, 0.0, 0.0, 0.0, shot1.balls, table, my_next)
+            total = s1 + self.lambda_future * s2 - 200.0 * rp
+            sims += 1
+            if total > best_score:
+                best_score = total
+                best = {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
+        self.stats_total_sims = int(sims)
+        if best is None:
+            safe_phis = [30.0, 90.0, 150.0, 210.0, 270.0, 330.0]
+            best_safe = None
+            best_safe_score = -1e9
+            for phi_s in safe_phis:
+                V0_s = 3.0
+                theta_s = 0.0
+                a_s = 0.0
+                b_s = 0.0
+                s_safe, shot_safe = trial_score(V0_s, phi_s, theta_s, a_s, b_s, balls, table, my_targets)
+                if shot_safe is not None:
+                    r_safe = reach_metric(shot_safe, my_targets)
+                    total_safe = s_safe + r_safe * 4.0
+                    if total_safe > best_safe_score:
+                        best_safe_score = total_safe
+                        best_safe = {'V0': float(V0_s), 'phi': float(phi_s), 'theta': float(theta_s), 'a': float(a_s), 'b': float(b_s)}
+            if best_safe is None:
+                return self._random_action()
+            return best_safe
         return best

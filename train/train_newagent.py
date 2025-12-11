@@ -11,28 +11,50 @@ _ROOT_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
-from agent import NewAgent
+# 确保本仓库内的 pooltool 源码包可被正确导入
+_PT_SRC_ROOT = os.path.join(_ROOT_DIR, 'pooltool')
+if _PT_SRC_ROOT not in sys.path:
+    sys.path.insert(0, _PT_SRC_ROOT)
+
+from agent import MCTSAgent
 from poolenv import PoolEnv
 from datetime import datetime
 import time
 from tqdm import tqdm
 
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    try:
+        from tensorboardX import SummaryWriter
+    except Exception:
+        class SummaryWriter:
+            def __init__(self, *args, **kwargs):
+                pass
+            def add_scalar(self, *args, **kwargs):
+                pass
+            def add_text(self, *args, **kwargs):
+                pass
+            def flush(self):
+                pass
+            def close(self):
+                pass
 
 def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fast=False):
-    agent = NewAgent(checkpoint=None, fast=fast, debug=verbose)
-    agent.k_targets = int(cfg['k_targets'])
-    agent.v_candidates = list(cfg['v_candidates'])
-    agent.theta_candidates = list(cfg['theta_candidates'])
-    agent.dphi_candidates = list(cfg['dphi_candidates'])
-    agent.offsets = list(cfg['offsets'])
-    agent.refine_dphi = list(cfg['refine_dphi'])
-    agent.refine_dv = list(cfg['refine_dv'])
-    agent.refine_offsets = list(cfg['refine_offsets'])
-    agent.use_pocket_aiming = bool(cfg.get('use_pocket_aiming', False))
-    agent.occlusion_filter = bool(cfg.get('occlusion_filter', False))
-    agent.robust_samples = int(cfg.get('robust_samples', 0))
-    agent.early_stop_score = cfg.get('early_stop_score', None)
+    agent = MCTSAgent()
+    if 'k_targets' in cfg:
+        agent.k_targets = int(cfg['k_targets'])
+    if 'v_candidates' in cfg:
+        agent.v_candidates = list(cfg['v_candidates'])
+    if 'theta_candidates' in cfg:
+        agent.theta_candidates = list(cfg['theta_candidates'])
+    if 'dphi_candidates' in cfg:
+        agent.dphi_candidates = list(cfg['dphi_candidates'])
+    if 'offsets' in cfg:
+        agent.offsets = list(cfg['offsets'])
+    agent.robust_samples = int(cfg.get('robust_samples', getattr(agent, 'robust_samples', 0)))
+    if 'lambda_future' in cfg:
+        agent.lambda_future = float(cfg['lambda_future'])
     total = 0.0
     trial_iter = range(n_trials)
     trial_iter = tqdm(trial_iter, desc=f"config {config_idx} trials", leave=False)
@@ -59,9 +81,11 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fa
             remaining = [bid for bid in my_targets if env.balls[bid].state.s != 4]
             reward += 100.0 if len(remaining) == 0 else -150.0
         if info.get('NO_POCKET_NO_RAIL'):
-            reward -= 20.0
+            reward -= 30.0
         if info.get('NO_HIT'):
             reward -= 30.0
+        if info.get('FOUL_FIRST_HIT'):
+            reward -= 40.0
         reward += len(info.get('ME_INTO_POCKET', [])) * 60.0
         reward -= len(info.get('ENEMY_INTO_POCKET', [])) * 25.0
         total += reward
@@ -106,47 +130,35 @@ def main():
     search_space = [
         {
             'k_targets': 2,
-            'v_candidates': [2.2, 3.0, 3.8],
+            'v_candidates': [2.6, 3.4],
             'theta_candidates': [0.0],
-            'dphi_candidates': [-2.0, 0.0, 2.0],
-            'offsets': [-0.02, 0.0, 0.02],
-            'refine_dphi': [-1.0, 0.0, 1.0],
-            'refine_dv': [0.0],
-            'refine_offsets': [-0.015, 0.0, 0.015],
-            'use_pocket_aiming': True,
-            'occlusion_filter': True,
-            'robust_samples': 5,
-            'early_stop_score': 40.0
+            'dphi_candidates': [-3.0, 0.0, 3.0],
+            'offsets': [-0.01, 0.0, 0.01],
+            'robust_samples': 3,
+            'lambda_future': 0.5,
         },
         {
             'k_targets': 1,
             'v_candidates': [2.2, 3.0, 3.8],
             'theta_candidates': [0.0],
-            'dphi_candidates': [-2.0, 0.0, 2.0],
-            'offsets': [-0.02, 0.0, 0.02],
-            'refine_dphi': [-1.0, 0.0, 1.0],
-            'refine_dv': [0.0],
-            'refine_offsets': [-0.015, 0.0, 0.015],
-            'use_pocket_aiming': True,
-            'occlusion_filter': True,
-            'robust_samples': 5,
-            'early_stop_score': 40.0
-        },
-        {
-            'k_targets': 2,
-            'v_candidates': [2.6, 3.4],
-            'theta_candidates': [0.0],
             'dphi_candidates': [-4.0, 0.0, 4.0],
-            'offsets': [0.0],
-            'refine_dphi': [0.0],
-            'refine_dv': [0.0],
-            'refine_offsets': [0.0],
-            'use_pocket_aiming': False,
-            'occlusion_filter': True,
-            'robust_samples': 0,
-            'early_stop_score': 30.0
-        }
+            'offsets': [-0.015, 0.0, 0.015],
+            'robust_samples': 5,
+            'lambda_future': 0.3,
+        },
     ]
+    if args.fast:
+        search_space = [
+            {
+                'k_targets': 1,
+                'v_candidates': [3.4],
+                'theta_candidates': [0.0],
+                'dphi_candidates': [0.0],
+                'offsets': [0.0],
+                'robust_samples': 0,
+                'lambda_future': 0.0,
+            }
+        ]
     best_cfg = None
     best_score = -1e9
     outer_iter = enumerate(search_space)
