@@ -1,4 +1,5 @@
 import math
+import pooltool as pt
 from pooltool.system.datatypes import System
 from pooltool.objects import Cue
 from pooltool.evolution import simulate
@@ -11,7 +12,7 @@ import random
 import signal
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
-
+import json
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
@@ -321,14 +322,9 @@ class BasicAgent(Agent):
                     else:
                         shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                     
-<<<<<<< HEAD:agent.py
-                    # 关键：使用 pooltool 物理引擎 (世界A)
-                    simulate(shot, inplace=True)
-=======
                     # 关键：使用带超时保护的物理模拟（3秒上限）
                     if not simulate_with_timeout(shot, timeout=3):
                         return 0  # 超时是物理引擎问题，不惩罚agent
->>>>>>> 74e09d927f2ce039de296d49e033204c0a2a6f6e:agents/basic_agent.py
                 except Exception as e:
                     # 模拟失败，给予极大惩罚
                     return -500
@@ -377,7 +373,6 @@ class BasicAgent(Agent):
             import traceback
             traceback.print_exc()
             return self._random_action()
-<<<<<<< HEAD:agent.py
 
 class NewAgent(Agent):
     def __init__(self, checkpoint: str = None, fast: bool = False, debug: bool = False):
@@ -1026,5 +1021,3 @@ class MCTSAgent(Agent):
                 return self._random_action()
             return best_safe
         return best
-=======
->>>>>>> 74e09d927f2ce039de296d49e033204c0a2a6f6e:agents/basic_agent.py
