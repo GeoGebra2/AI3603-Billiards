@@ -1,0 +1,63 @@
+[
+  {
+    "config_idx": 0,
+    "config": {
+      "k_targets": 2,
+      "v_candidates": [
+        2.6,
+        3.4
+      ],
+      "theta_candidates": [
+        0.0
+      ],
+      "dphi_candidates": [
+        -3.0,
+        0.0,
+        3.0
+      ],
+      "offsets": [
+        -0.01,
+        0.0,
+        0.01
+      ],
+      "robust_samples": 3,
+      "lambda_future": 0.5
+    },
+    "avg_reward": -43.25,
+    "avg_decision_time_s": 20.24015905857086,
+    "fallback_count": 0,
+    "sims_total": 29,
+    "k_targets": 2
+  },
+  {
+    "config_idx": 1,
+    "config": {
+      "k_targets": 1,
+      "v_candidates": [
+        2.2,
+        3.0,
+        3.8
+      ],
+      "theta_candidates": [
+        0.0
+      ],
+      "dphi_candidates": [
+        -4.0,
+        0.0,
+        4.0
+      ],
+      "offsets": [
+        -0.015,
+        0.0,
+        0.015
+      ],
+      "robust_samples": 5,
+      "lambda_future": 0.3
+    },
+    "avg_reward": -27.5,
+    "avg_decision_time_s": 17.41865657567978,
+    "fallback_count": 0,
+    "sims_total": 29,
+    "k_targets": 1
+  }
+]

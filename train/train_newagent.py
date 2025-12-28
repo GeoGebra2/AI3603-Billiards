@@ -16,7 +16,7 @@ _PT_SRC_ROOT = os.path.join(_ROOT_DIR, 'pooltool')
 if _PT_SRC_ROOT not in sys.path:
     sys.path.insert(0, _PT_SRC_ROOT)
 
-from agent import MCTSAgent
+from agents import MCTSAgent
 from poolenv import PoolEnv
 from datetime import datetime
 import time
@@ -41,7 +41,10 @@ except Exception:
                 pass
 
 def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fast=False):
-    agent = MCTSAgent()
+    # Do NOT load a global template here; create agent with built-in defaults only.
+    # This prevents external template files from silently overriding runtime timeouts
+    # and other critical parameters during training runs.
+    agent = MCTSAgent(checkpoint=None)
     if 'k_targets' in cfg:
         agent.k_targets = int(cfg['k_targets'])
     if 'v_candidates' in cfg:
@@ -58,6 +61,9 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fa
     total = 0.0
     trial_iter = range(n_trials)
     trial_iter = tqdm(trial_iter, desc=f"config {config_idx} trials", leave=False)
+    # detailed stats
+    total_decision_time = 0.0
+    fallback_count = 0
     for i in trial_iter:
         t0 = time.time()
         target_ball = ['solid', 'stripe'][i % 2]
@@ -66,11 +72,35 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fa
         env.reset(target_ball=target_ball)
         player = env.get_curr_player()
         balls, my_targets, table = env.get_observation(player)
+        # 安全调用 agent.decision：加入超时检测与异常回退，避免单次决策导致整个训练中断
+        DECISION_TIMEOUT = getattr(agent, 'decision_timeout', 180)
         t_decision0 = time.time()
-        action = agent.decision(balls, my_targets, table)
-        t_decision = time.time() - t_decision0
+        action = None
+        fallback_flag = False
+        try:
+            action = agent.decision(balls, my_targets, table)
+            t_decision = time.time() - t_decision0
+            if t_decision > DECISION_TIMEOUT:
+                # 决策耗时异常长，回退为随机动作以保证训练继续
+                print(f"[WARN] decision 超时 ({t_decision:.1f}s) — 使用随机动作回退")
+                action = agent._random_action()
+                fallback_flag = True
+        except Exception as e:
+            # 捕获任何异常，记录并回退为随机动作
+            print(f"[ERROR] agent.decision 抛异常: {e}")
+            import traceback
+            traceback.print_exc()
+            action = agent._random_action()
+            t_decision = time.time() - t_decision0
+            fallback_flag = True
+        if fallback_flag:
+            fallback_count += 1
+        total_decision_time += float(t_decision)
         if verbose:
-            tqdm.write(f"[config {config_idx} trial {i}] decision_time={t_decision:.2f}s action=V0:{action['V0']:.2f},phi:{action['phi']:.2f},theta:{action['theta']:.2f},a:{action['a']:.3f},b:{action['b']:.3f}")
+            try:
+                tqdm.write(f"[config {config_idx} trial {i}] decision_time={t_decision:.2f}s action=V0:{action['V0']:.2f},phi:{action['phi']:.2f},theta:{action['theta']:.2f},a:{action['a']:.3f},b:{action['b']:.3f}")
+            except Exception:
+                tqdm.write(f"[config {config_idx} trial {i}] decision_time={t_decision:.2f}s action=ERROR_FORMAT")
         info = env.take_shot(action)
         reward = 0.0
         if info.get('WHITE_BALL_INTO_POCKET') and info.get('BLACK_BALL_INTO_POCKET'):
@@ -111,7 +141,17 @@ def eval_config(env, cfg, n_trials, writer=None, config_idx=0, verbose=False, fa
             writer.add_scalar(f'config_{config_idx}/occluded_filtered_target', getattr(agent, 'stats_occluded_target_count', 0), i)
             writer.add_scalar(f'config_{config_idx}/occluded_filtered_pocket', getattr(agent, 'stats_occluded_pocket_count', 0), i)
             writer.add_scalar(f'config_{config_idx}/sims_total', getattr(agent, 'stats_total_sims', 0), i)
-    return total / float(max(1, n_trials))
+    # assemble detailed results for this config
+    results = {
+        'config_idx': config_idx,
+        'config': cfg,
+        'avg_reward': total / float(max(1, n_trials)),
+        'avg_decision_time_s': total_decision_time / float(max(1, n_trials)),
+        'fallback_count': int(fallback_count),
+        'sims_total': int(getattr(agent, 'stats_total_sims', 0)),
+        'k_targets': int(getattr(agent, 'k_targets', 0))
+    }
+    return results['avg_reward'], results
 
 def main():
     parser = argparse.ArgumentParser()
@@ -163,19 +203,37 @@ def main():
     best_score = -1e9
     outer_iter = enumerate(search_space)
     outer_iter = tqdm(list(outer_iter), desc='configs', leave=True)
+    results_all = []
     for idx_cfg, cfg in outer_iter:
-        score = eval_config(env, cfg, n_trials=args.episodes, writer=writer, config_idx=idx_cfg, verbose=args.verbose, fast=args.fast)
+        score, res = eval_config(env, cfg, n_trials=args.episodes, writer=writer, config_idx=idx_cfg, verbose=args.verbose, fast=args.fast)
+        results_all.append(res)
         if score > best_score:
             best_score = score
             best_cfg = cfg
         if writer is not None:
             writer.add_scalar('config/avg_reward', score, idx_cfg)
+        # save the tested config as a standalone JSON for later evaluation
+        try:
+            configs_dir = os.path.join('eval', 'configs')
+            os.makedirs(configs_dir, exist_ok=True)
+            cfg_path = os.path.join(configs_dir, f'config_{idx_cfg}.json')
+            with open(cfg_path, 'w', encoding='utf-8') as cf:
+                json.dump(cfg, cf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     if writer is not None:
         writer.add_text('meta', json.dumps({'episodes': args.episodes, 'out': args.out}))
         writer.flush()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
         json.dump(best_cfg, f, ensure_ascii=False, indent=2)
+    # also save detailed per-config results for analysis
+    try:
+        os.makedirs(os.path.dirname('eval/config_results.json'), exist_ok=True)
+        with open(os.path.join('eval', 'config_results.json'), 'w', encoding='utf-8') as rf:
+            json.dump(results_all, rf, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     print(json.dumps({'out': args.out, 'avg_reward': best_score}, ensure_ascii=False))
     if writer is not None:
         writer.add_text('best', json.dumps({'avg_reward': best_score, 'checkpoint': args.out}, ensure_ascii=False))

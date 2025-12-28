@@ -1,17 +1,23 @@
 {
   "k_targets": 1,
   "v_candidates": [
-    3.4
+    2.2,
+    3.0,
+    3.8
   ],
   "theta_candidates": [
     0.0
   ],
   "dphi_candidates": [
-    0.0
+    -4.0,
+    0.0,
+    4.0
   ],
   "offsets": [
-    0.0
+    -0.015,
+    0.0,
+    0.015
   ],
-  "robust_samples": 0,
-  "lambda_future": 0.0
+  "robust_samples": 5,
+  "lambda_future": 0.3
 }

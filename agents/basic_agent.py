@@ -776,42 +776,117 @@ class NewAgent(Agent):
 class MCTSAgent(Agent):
     def __init__(self, checkpoint: str = None):
         super().__init__()
+        # default search/config values (can be overridden by config file or dict)
         self.k_targets = 2
         self.v_candidates = [2.6, 3.4]
         self.theta_candidates = [0.0]
         self.dphi_candidates = [-3.0, 0.0, 3.0]
         self.offsets = [-0.01, 0.0, 0.01]
-        self.robust_samples = 3
+        self.robust_samples = 2
         self.robust_noise_std = {'V0': 0.08, 'phi': 0.06, 'theta': 0.04, 'a': 0.002, 'b': 0.002}
-        self.lambda_future = 0.4
+        self.lambda_future = 0.35
         self.stats_total_sims = 0
+
+        # MCTS / runtime parameters (defaults)
+        self.mcts_iterations = 30
+        self.c_puct = 1.25
+        self.max_candidates = 12
+        self.rollout_sample_size = 6
+        self.expansion_per_node = 4
+        # per-simulation timeouts (seconds)
+        self.simulation_timeout = 2.5
+        self.rollout_timeout = 1.5
+        # overall decision timeout (guard in training wrapper is separate)
+        self.decision_timeout = 180
+
+        # candidate generation tuning defaults
+        self.cand_k_v = 1.8
+        self.cand_c_v = 0.8
+        self.cand_ref_d = 1.0
+        self.cand_alpha_dphi = 6.0
+        self.cand_max_dphi = 12.0
+        self.cand_v_factors = [0.88, 1.0, 1.12]
+        self.cand_base_offsets = [0.0, 0.01, -0.01]
+
+        # load optional checkpoint (path or dict)
+        cfg = None
         if checkpoint is None:
             default_path = os.path.join('eval', 'checkpoints', 'newagent_config.json')
             checkpoint = default_path if os.path.exists(default_path) else None
-        if checkpoint is not None and os.path.isfile(checkpoint):
-            try:
+
+        try:
+            if isinstance(checkpoint, dict):
+                cfg = checkpoint
+            elif isinstance(checkpoint, str) and os.path.isfile(checkpoint):
                 with open(checkpoint, 'r', encoding='utf-8') as f:
                     cfg = json.load(f)
-                if 'k_targets' in cfg:
-                    self.k_targets = int(cfg['k_targets'])
-                if 'v_candidates' in cfg:
-                    self.v_candidates = list(cfg['v_candidates'])
-                if 'theta_candidates' in cfg:
-                    self.theta_candidates = list(cfg['theta_candidates'])
-                if 'dphi_candidates' in cfg:
-                    self.dphi_candidates = list(cfg['dphi_candidates'])
-                if 'offsets' in cfg:
-                    self.offsets = list(cfg['offsets'])
-                if 'robust_samples' in cfg:
-                    self.robust_samples = int(cfg['robust_samples'])
-                if 'lambda_future' in cfg:
-                    self.lambda_future = float(cfg['lambda_future'])
-            except Exception:
-                pass
+        except Exception:
+            cfg = None
+
+        if cfg:
+            # top-level simple mappings
+            self.k_targets = int(cfg.get('k_targets', self.k_targets))
+            if 'v_candidates' in cfg:
+                self.v_candidates = list(cfg.get('v_candidates', self.v_candidates))
+            if 'theta_candidates' in cfg:
+                self.theta_candidates = list(cfg.get('theta_candidates', self.theta_candidates))
+            if 'dphi_candidates' in cfg:
+                self.dphi_candidates = list(cfg.get('dphi_candidates', self.dphi_candidates))
+            if 'offsets' in cfg:
+                self.offsets = list(cfg.get('offsets', self.offsets))
+            self.robust_samples = int(cfg.get('robust_samples', self.robust_samples))
+            self.lambda_future = float(cfg.get('lambda_future', self.lambda_future))
+
+            # mcts / runtime mappings
+            self.mcts_iterations = int(cfg.get('mcts_iterations', self.mcts_iterations))
+            self.c_puct = float(cfg.get('c_puct', self.c_puct))
+            self.max_candidates = int(cfg.get('max_candidates', self.max_candidates))
+            self.rollout_sample_size = int(cfg.get('rollout_sample_size', self.rollout_sample_size))
+            self.expansion_per_node = int(cfg.get('expansion_per_node', self.expansion_per_node))
+            self.decision_timeout = float(cfg.get('decision_timeout', self.decision_timeout))
+
+            # timeouts for internal simulate calls (optional)
+            self.simulation_timeout = float(cfg.get('simulation_timeout', self.simulation_timeout))
+            self.rollout_timeout = float(cfg.get('rollout_timeout', self.rollout_timeout))
+
+            # nested candidate_generation
+            cg = cfg.get('candidate_generation', {}) if isinstance(cfg, dict) else {}
+            self.cand_k_v = float(cg.get('k_v', self.cand_k_v))
+            self.cand_c_v = float(cg.get('c_v', self.cand_c_v))
+            self.cand_ref_d = float(cg.get('ref_d', self.cand_ref_d))
+            self.cand_alpha_dphi = float(cg.get('alpha_dphi', self.cand_alpha_dphi))
+            self.cand_max_dphi = float(cg.get('max_dphi', self.cand_max_dphi))
+            self.cand_v_factors = list(cg.get('v_factors', self.cand_v_factors))
+            self.cand_base_offsets = list(cg.get('base_offsets', self.cand_base_offsets))
+            self.max_candidates = int(cg.get('max_candidates', self.max_candidates))
+
+            # robustness
+            rob = cfg.get('robustness', {}) if isinstance(cfg, dict) else {}
+            self.robust_samples = int(rob.get('robust_samples', self.robust_samples))
+            self.robust_noise_std = dict(rob.get('robust_noise_std', self.robust_noise_std))
+
+            # future and risk
+            fr = cfg.get('future_and_risk', {}) if isinstance(cfg, dict) else {}
+            self.lambda_future = float(fr.get('lambda_future', self.lambda_future))
+            self.risk_penalty_coeff = float(fr.get('risk_penalty_coeff', 200.0))
 
     def decision(self, balls=None, my_targets=None, table=None):
+        """UCT-style MCTS decision. Modifies only MCTSAgent behaviour.
+
+        Characteristics:
+        - Small fixed-iteration MCTS (keeps runtime predictable)
+        - Fast rollout policy sampling a few candidate shots
+        - Per-simulation timeout via ThreadPoolExecutor.result(timeout=...)
+        - Small transposition cache (in-memory) to reuse previously simulated states
+        """
+        # local imports to avoid changing module-level imports
+        import concurrent.futures
+        import time
+
         if balls is None or my_targets is None or table is None:
             return self._random_action()
+
+        # basic snapshots
         last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         remaining = [bid for bid in my_targets if balls[bid].state.s != 4]
         if len(remaining) == 0:
@@ -819,34 +894,11 @@ class MCTSAgent(Agent):
             remaining = ["8"]
         cue_pos = balls['cue'].state.rvw[0][0:2]
 
+        # simple helpers (reused logic from existing agent implementations)
         def ang(a, b):
             dx = b[0] - a[0]
             dy = b[1] - a[1]
             return float((math.degrees(math.atan2(dy, dx)) % 360))
-
-        def dist_and_t(p, a, b):
-            ap = p - a
-            ab = b - a
-            denom = float(np.dot(ab, ab))
-            if denom <= 1e-9:
-                return float(np.linalg.norm(ap)), 0.0
-            t = float(np.dot(ap, ab) / denom)
-            t = max(0.0, min(1.0, t))
-            closest = a + t * ab
-            return float(np.linalg.norm(p - closest)), t
-
-        def occluded(a, b, ignore_ids=None):
-            thresh = 0.015
-            for k, ball in balls.items():
-                if ignore_ids and k in ignore_ids:
-                    continue
-                if balls[k].state.s == 4:
-                    continue
-                pos = ball.state.rvw[0][0:2]
-                d, tt = dist_and_t(pos, a, b)
-                if d < thresh and 0.1 < tt < 0.9:
-                    return True
-            return False
 
         def ghost_phi(cue, target, pocket):
             v = pocket - target
@@ -858,166 +910,233 @@ class MCTSAgent(Agent):
             ghost = target - u * d
             return ang(cue, ghost)
 
-        def reach_metric(shot, my_targets_now):
-            cue_new = shot.balls['cue'].state.rvw[0][0:2]
-            remain = [x for x in my_targets_now if shot.balls[x].state.s != 4]
-            r = 0
-            for x in remain:
-                t2 = shot.balls[x].state.rvw[0][0:2]
-                if not occluded(cue_new, t2, ignore_ids=['cue', x]):
-                    r += 1
-            return float(min(3, r))
-
-        def trial_score(V0, phi, theta, a, b, balls0, table0, my_targets_now):
-            sim_balls = {k: copy.deepcopy(v) for k, v in balls0.items()}
-            sim_table = copy.deepcopy(table0)
-            cue = Cue(cue_ball_id="cue")
-            shot = System(table=sim_table, balls=sim_balls, cue=cue)
-            try:
-                shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
-                simulate(shot, inplace=True)
-            except Exception:
-                return -1e9, None
-            base = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets_now)
-            r = reach_metric(shot, my_targets_now)
-            return float(base + r * 8.0), shot
-
-        def risk_penalty(V0, phi, theta, a, b, balls0, table0, my_targets_now):
-            bad = 0
-            total = max(1, int(self.robust_samples))
-            for _ in range(total):
-                V0n = float(np.clip(V0 + np.random.normal(0, self.robust_noise_std['V0']), 0.5, 8.0))
-                phin = float((phi + np.random.normal(0, self.robust_noise_std['phi'])) % 360)
-                thetan = float(np.clip(theta + np.random.normal(0, self.robust_noise_std['theta']), 0, 90))
-                an = float(np.clip(a + np.random.normal(0, self.robust_noise_std['a']), -0.5, 0.5))
-                bn = float(np.clip(b + np.random.normal(0, self.robust_noise_std['b']), -0.5, 0.5))
-                sim_balls = {k: copy.deepcopy(v) for k, v in balls0.items()}
-                sim_table = copy.deepcopy(table0)
-                cue = Cue(cue_ball_id="cue")
-                shot = System(table=sim_table, balls=sim_balls, cue=cue)
-                try:
-                    shot.cue.set_state(V0=V0n, phi=phin, theta=thetan, a=an, b=bn)
-                    simulate(shot, inplace=True)
-                except Exception:
-                    bad += 1
+        def occluded_tp(t, p, ignore_ids=None):
+            thresh = 0.015
+            for k, ball in balls.items():
+                if ignore_ids and k in ignore_ids:
                     continue
-                new_pocketed = [bid for bid, bbb in shot.balls.items() if bbb.state.s == 4 and last_state_snapshot[bid].state.s != 4]
-                foul_first_hit = False
-                first_contact_ball_id = None
-                for e in shot.events:
-                    et = str(e.event_type).lower()
-                    ids = list(e.ids) if hasattr(e, 'ids') else []
-                    if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
-                        other_ids = [i for i in ids if i != 'cue']
-                        if other_ids:
-                            first_contact_ball_id = other_ids[0]
-                            break
-                if first_contact_ball_id is None:
-                    if len(last_state_snapshot) > 2:
-                        foul_first_hit = True
-                else:
-                    remaining_own_before = [bid for bid in my_targets_now if last_state_snapshot[bid].state.s != 4]
-                    opponent_plus_eight = [bid for bid in last_state_snapshot.keys() if bid not in my_targets_now and bid not in ['cue']]
-                    if ('8' not in opponent_plus_eight):
-                        opponent_plus_eight.append('8')
-                    if len(remaining_own_before) > 0:
-                        if first_contact_ball_id in opponent_plus_eight:
-                            foul_first_hit = True
-                    else:
-                        if first_contact_ball_id != '8':
-                            foul_first_hit = True
-                foul_no_rail = False
-                cue_hit_cushion = False
-                target_hit_cushion = False
-                for e in shot.events:
-                    et = str(e.event_type).lower()
-                    ids = list(e.ids) if hasattr(e, 'ids') else []
-                    if 'cushion' in et:
-                        if 'cue' in ids:
-                            cue_hit_cushion = True
-                        if first_contact_ball_id is not None and first_contact_ball_id in ids:
-                            target_hit_cushion = True
-                if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
-                    foul_no_rail = True
-                if ('cue' in new_pocketed) or foul_first_hit or foul_no_rail:
-                    bad += 1
-            return float(bad) / float(total)
+                if balls[k].state.s == 4:
+                    continue
+                pos = ball.state.rvw[0][0:2]
+                ap = pos - t
+                ab = p - t
+                denom = float(np.dot(ab, ab))
+                if denom <= 1e-9:
+                    continue
+                tt = float(np.dot(ap, ab) / denom)
+                tt = max(0.0, min(1.0, tt))
+                closest = t + tt * ab
+                d = float(np.linalg.norm(pos - closest))
+                if d < thresh and 0.1 < tt < 0.9:
+                    return True
+            return False
 
+        # candidate generation: adaptive per-target generator using configured template params
         targets_sorted = sorted(remaining, key=lambda bid: np.linalg.norm(balls[bid].state.rvw[0][0:2] - cue_pos))
         targets_sorted = targets_sorted[:self.k_targets]
         candidates = []
-        for bid in targets_sorted:
+
+        def generate_for_target(bid):
             tpos = balls[bid].state.rvw[0][0:2]
+            d = float(np.linalg.norm(tpos - cue_pos))
+            # estimate required V0 using linear heuristic
+            V_req = max(0.5, float(self.cand_k_v * d + self.cand_c_v))
+            # dynamic dphi range
+            dphi_max = min(float(self.cand_max_dphi), float(self.cand_alpha_dphi) * (d / max(1e-6, float(self.cand_ref_d))))
+            # offsets scaled by distance (closer -> smaller offsets)
+            offset_scale = min(1.0, d / max(1e-6, float(self.cand_ref_d)))
+            offsets = [o * offset_scale for o in list(self.cand_base_offsets)]
+
             pocket_phis = []
             if hasattr(table, 'pockets') and isinstance(table.pockets, dict):
                 for pk in table.pockets:
                     ppos = table.pockets[pk].center[0:2]
-                    if not occluded(tpos, ppos, ignore_ids=[bid, 'cue']):
+                    if not occluded_tp(tpos, ppos, ignore_ids=[bid, 'cue']):
                         pocket_phis.append(ghost_phi(cue_pos, tpos, ppos))
             if not pocket_phis:
-                pocket_phis.append(ang(cue_pos, tpos))
-            for phi0 in pocket_phis:
-                for dphi in self.dphi_candidates:
-                    phi = (phi0 + dphi) % 360
-                    for V0 in self.v_candidates:
-                        for theta in self.theta_candidates:
-                            for a in self.offsets:
-                                for b in self.offsets:
-                                    candidates.append((V0, phi, theta, a, b))
+                pocket_phis = [ang(cue_pos, tpos)]
 
-        best = None
-        best_score = -1e9
-        sims = 0
+            v_candidates = [float(np.clip(V_req * f, 0.5, 8.0)) for f in list(self.cand_v_factors)]
+            # dphi candidates derived from dynamic max
+            if dphi_max <= 0.0:
+                dphi_list = [0.0]
+            else:
+                # choose three points: -max, 0, +max (can be extended)
+                dphi_list = [-dphi_max, 0.0, dphi_max]
+
+            out = []
+            for phi0 in pocket_phis:
+                for dphi in dphi_list:
+                    phi = (phi0 + dphi) % 360
+                    for V0 in v_candidates:
+                        for a in offsets:
+                            for b in offsets:
+                                out.append((V0, phi, 0.0, a, b))
+            return out
+
+        # aggregate and limit candidates
+        for bid in targets_sorted:
+            cand_for = generate_for_target(bid)
+            candidates.extend(cand_for)
+
+        # deduplicate approximately by rounding V0 and phi
+        uniq = {}
         for V0, phi, theta, a, b in candidates:
-            rp = risk_penalty(V0, phi, theta, a, b, balls, table, my_targets)
-            if rp >= 0.67:
+            key = (int(round(V0*100)), int(round(phi)))
+            if key not in uniq:
+                uniq[key] = (V0, phi, theta, a, b)
+        candidates = list(uniq.values())
+        # sort candidates by proximity to ideal (prefer lower V0 and nearer phi to ghost)
+        candidates = sorted(candidates, key=lambda x: (x[0], abs(x[1] - ang(cue_pos, balls[targets_sorted[0]].state.rvw[0][0:2]))))
+        # limit overall candidates to configured max
+        candidates = candidates[:max(1, int(getattr(self, 'max_candidates', 12)))]
+
+        if not candidates:
+            return self._random_action()
+
+        # small transposition cache keyed by a lightweight state-hash
+        transposition = {}
+
+        def state_hash(balls_state):
+            # create a compact fingerprint of pocketed flags + coarse positions
+            items = []
+            for k, v in sorted(balls_state.items()):
+                pos = v.state.rvw[0][0:2]
+                items.append((k, int(round(pos[0]*100)), int(round(pos[1]*100)), int(v.state.s)))
+            return tuple(items)
+
+        # run a single simulation with timeout; returns (score, shot) or (None, None) on failure
+        def run_simulation_with_timeout(V0, phi, theta, a, b, balls_src, table_src, timeout_s=None):
+            def _worker():
+                sim_balls = {k: copy.deepcopy(v) for k, v in balls_src.items()}
+                sim_table = copy.deepcopy(table_src)
+                cue = Cue(cue_ball_id="cue")
+                shot = System(table=sim_table, balls=sim_balls, cue=cue)
+                shot.cue.set_state(V0=float(V0), phi=float(phi), theta=float(theta), a=float(a), b=float(b))
+                simulate(shot, inplace=True)
+                return shot
+
+            if timeout_s is None:
+                timeout_s = float(self.simulation_timeout)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_worker)
+                try:
+                    shot = fut.result(timeout=timeout_s)
+                except concurrent.futures.TimeoutError:
+                    return None, None
+                except Exception:
+                    return None, None
+                return shot, shot
+
+        def rollout_policy(balls_src, table_src, my_targets_now):
+            # quick policy: evaluate small random subset of candidates and return best score
+            best_local = -1e9
+            best_action = None
+            # sample up to rollout_sample_size random candidates to keep rollout cheap
+            sample = random.sample(candidates, min(len(candidates), max(1, int(self.rollout_sample_size))))
+            for V0, phi, theta, a, b in sample:
+                # check cache
+                h = state_hash(balls_src)
+                key = (h, int(round(V0*100)), int(round(phi)))
+                if key in transposition:
+                    sc = transposition[key]
+                else:
+                    shot, shot_ret = run_simulation_with_timeout(V0, phi, theta, a, b, balls_src, table_src, timeout_s=self.rollout_timeout)
+                    if shot is None:
+                        sc = -1e9
+                    else:
+                        sc = analyze_shot_for_reward(shot=shot, last_state=last_state_snapshot, player_targets=my_targets_now)
+                    transposition[key] = sc
+                if sc > best_local:
+                    best_local = sc
+                    best_action = (V0, phi, theta, a, b)
+            return best_local, best_action
+
+        # simple UCT node
+        class Node:
+            __slots__ = ('parent', 'action', 'visits', 'value', 'children', 'state')
+            def __init__(self, parent, action, state):
+                self.parent = parent
+                self.action = action
+                self.visits = 0
+                self.value = 0.0
+                self.children = []
+                self.state = state
+
+        root_state = {k: copy.deepcopy(v) for k, v in balls.items()}
+        root = Node(parent=None, action=None, state=root_state)
+
+        ITERATIONS = int(self.mcts_iterations)
+        C_PUCT = float(self.c_puct)
+
+        for it in range(ITERATIONS):
+            # selection
+            node = root
+            path = [node]
+            while node.children:
+                # UCT: value/visits + c * sqrt(ln(N)/n)
+                total_visits = sum(ch.visits for ch in node.children) + 1
+                best_score = -1e9
+                best_child = None
+                for ch in node.children:
+                    if ch.visits == 0:
+                        score = 1e9 + random.random()
+                    else:
+                        score = (ch.value / ch.visits) + C_PUCT * math.sqrt(math.log(total_visits) / ch.visits)
+                    if score > best_score:
+                        best_score = score
+                        best_child = ch
+                node = best_child
+                path.append(node)
+
+            # expansion
+            # expand with a few random candidate actions
+            state_for_expand = node.state
+            # pick up to expansion_per_node actions not yet in children
+            tried = set(ch.action for ch in node.children)
+            actions_pool = [a for a in candidates if a not in tried]
+            random.shuffle(actions_pool)
+            expand_actions = actions_pool[:max(1, int(self.expansion_per_node))]
+            if not expand_actions:
+                # leaf node; perform rollout from here
+                score_rollout, act = rollout_policy(state_for_expand, table, my_targets)
+                reward = score_rollout
+                # backprop
+                for p in reversed(path):
+                    p.visits += 1
+                    p.value += reward
                 continue
-            s1, shot1 = trial_score(V0, phi, theta, a, b, balls, table, my_targets)
-            if shot1 is None:
-                continue
-            my_next = my_targets
-            s2 = 0.0
-            cue_next = shot1.balls['cue'].state.rvw[0][0:2]
-            remain_next = [x for x in my_next if shot1.balls[x].state.s != 4]
-            if len(remain_next) == 0:
-                remain_next = ["8"]
-            if hasattr(table, 'pockets') and isinstance(table.pockets, dict):
-                for x in remain_next[:1]:
-                    tpos2 = shot1.balls[x].state.rvw[0][0:2]
-                    pk2 = None
-                    mind = 1e9
-                    for pk in table.pockets:
-                        ppos = table.pockets[pk].center[0:2]
-                        dpk = float(np.linalg.norm(ppos - tpos2))
-                        if dpk < mind and not occluded(tpos2, ppos, ignore_ids=[x, 'cue']):
-                            mind = dpk
-                            pk2 = pk
-                    if pk2 is not None:
-                        phi2 = ghost_phi(cue_next, tpos2, table.pockets[pk2].center[0:2])
-                        s2, _ = trial_score(3.0, phi2, 0.0, 0.0, 0.0, shot1.balls, table, my_next)
-            total = s1 + self.lambda_future * s2 - 200.0 * rp
-            sims += 1
-            if total > best_score:
-                best_score = total
-                best = {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
-        self.stats_total_sims = int(sims)
-        if best is None:
-            safe_phis = [30.0, 90.0, 150.0, 210.0, 270.0, 330.0]
-            best_safe = None
-            best_safe_score = -1e9
-            for phi_s in safe_phis:
-                V0_s = 3.0
-                theta_s = 0.0
-                a_s = 0.0
-                b_s = 0.0
-                s_safe, shot_safe = trial_score(V0_s, phi_s, theta_s, a_s, b_s, balls, table, my_targets)
-                if shot_safe is not None:
-                    r_safe = reach_metric(shot_safe, my_targets)
-                    total_safe = s_safe + r_safe * 4.0
-                    if total_safe > best_safe_score:
-                        best_safe_score = total_safe
-                        best_safe = {'V0': float(V0_s), 'phi': float(phi_s), 'theta': float(theta_s), 'a': float(a_s), 'b': float(b_s)}
-            if best_safe is None:
-                return self._random_action()
-            return best_safe
-        return best
+
+            for act in expand_actions:
+                # simulate the action briefly to get next state
+                V0, phi, theta, a, b = act
+                shot, shot_ret = run_simulation_with_timeout(V0, phi, theta, a, b, state_for_expand, table, timeout_s=self.simulation_timeout)
+                if shot is None:
+                    continue
+                next_state = {k: copy.deepcopy(v) for k, v in shot.balls.items()}
+                child = Node(parent=node, action=act, state=next_state)
+                node.children.append(child)
+
+            # rollout from a newly added child if any
+            if node.children:
+                child = random.choice(node.children)
+                score_rollout, act = rollout_policy(child.state, table, my_targets)
+                reward = score_rollout
+                # backprop
+                for p in reversed(path):
+                    p.visits += 1
+                    p.value += reward
+
+        # choose best child of root by visit count / value
+        if not root.children:
+            return self._random_action()
+
+        best_child = max(root.children, key=lambda ch: (ch.visits, ch.value))
+        best_act = best_child.action
+        # record stats roughly
+        self.stats_total_sims = int(sum(ch.visits for ch in root.children))
+        if best_act is None:
+            return self._random_action()
+        V0, phi, theta, a, b = best_act
+        return {'V0': float(V0), 'phi': float(phi), 'theta': float(theta), 'a': float(a), 'b': float(b)}
