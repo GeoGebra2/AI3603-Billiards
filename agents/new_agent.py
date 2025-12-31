@@ -35,11 +35,11 @@ class MCTSProAgent(Agent):
         self.max_candidates = max_candidates
         self.ball_radius = 0.028575
         self.sim_noise = {'V0': 0.1, 'phi': 0.15, 'theta': 0.1, 'a': 0.005, 'b': 0.005}
-        self.robust_samples = 3
+        self.robust_samples = 4
         self.simulation_timeout = 2.0
         self.rollout_timeout = 1.0
-        self.lambda_future = 0.3
-        self.gamma_next = 0.2
+        self.lambda_future = 0.35
+        self.gamma_next = 0.35
         self.rollout_top_k = 6
         self.prior_weight = 0.2
         self.robust_samples_next = 1
@@ -66,6 +66,17 @@ class MCTSProAgent(Agent):
         dist_cue_to_ghost = np.linalg.norm(vec_cue_to_ghost)
         phi = self._calc_angle_degrees(vec_cue_to_ghost)
         return phi, dist_cue_to_ghost
+    def _ghost_info(self, cue_pos, obj_pos, pocket_pos):
+        vec_obj_to_pocket = np.array(pocket_pos) - np.array(obj_pos)
+        dist_obj_to_pocket = np.linalg.norm(vec_obj_to_pocket)
+        if dist_obj_to_pocket == 0:
+            return 0.0, 0.0, np.array(obj_pos)
+        unit_vec = vec_obj_to_pocket / dist_obj_to_pocket
+        ghost_pos = np.array(obj_pos) - unit_vec * (2 * self.ball_radius)
+        vec_cue_to_ghost = ghost_pos - np.array(cue_pos)
+        dist_cue_to_ghost = np.linalg.norm(vec_cue_to_ghost)
+        phi = self._calc_angle_degrees(vec_cue_to_ghost)
+        return phi, dist_cue_to_ghost, ghost_pos
 
     def _occluded_tp(self, balls, t, p, ignore_ids=None):
         thresh = 0.015
@@ -83,6 +94,26 @@ class MCTSProAgent(Agent):
             tt = float(np.dot(ap, ab) / denom)
             tt = max(0.0, min(1.0, tt))
             closest = t + tt * ab
+            d = float(np.linalg.norm(pos - closest))
+            if d < thresh and 0.1 < tt < 0.9:
+                return True
+        return False
+    def _occluded_cg(self, balls, c, g, ignore_ids=None):
+        thresh = 0.015
+        for k, ball in balls.items():
+            if ignore_ids and k in ignore_ids:
+                continue
+            if ball.state.s == 4:
+                continue
+            pos = ball.state.rvw[0][0:2]
+            ap = pos - c
+            ab = g - c
+            denom = float(np.dot(ab, ab))
+            if denom <= 1e-9:
+                continue
+            tt = float(np.dot(ap, ab) / denom)
+            tt = max(0.0, min(1.0, tt))
+            closest = c + tt * ab
             d = float(np.linalg.norm(pos - closest))
             if d < thresh and 0.1 < tt < 0.9:
                 return True
@@ -108,8 +139,9 @@ class MCTSProAgent(Agent):
             for pk, pocket in table.pockets.items():
                 ppos = pocket.center[0:2]
                 if not self._occluded_tp(balls, obj_pos, ppos, ignore_ids=[tid, 'cue']):
-                    phi0, _ = self._get_ghost_ball_target(cue_pos, obj_pos, ppos)
-                    pocket_phis.append(phi0)
+                    phi0, _, ghost = self._ghost_info(cue_pos, obj_pos, ppos)
+                    if not self._occluded_cg(balls, cue_pos, ghost, ignore_ids=[tid, 'cue']):
+                        pocket_phis.append(phi0)
             if not pocket_phis:
                 phi0 = self._calc_angle_degrees(np.array(obj_pos) - np.array(cue_pos))
                 pocket_phis = [phi0]
@@ -125,12 +157,18 @@ class MCTSProAgent(Agent):
                         for a in offsets:
                             for b in offsets:
                                 actions.append({'V0': V0, 'phi': phi, 'theta': 0.0, 'a': a, 'b': b, 'V_req': V_req, 'dphi': float(dphi), 'dphi_max': float(dphi_max)})
+        if len(actions) == 0:
+            for tid in target_ids:
+                obj_pos = balls[tid].state.rvw[0][0:2]
+                phi_line = self._calc_angle_degrees(np.array(obj_pos) - np.array(cue_pos))
+                actions.append({'V0': 1.2, 'phi': phi_line, 'theta': 0.0, 'a': 0.0, 'b': 0.0, 'V_req': 1.2, 'dphi': 0.0, 'dphi_max': 1.0})
         uniq = {}
         for a in actions:
             k = (int(round(a['V0'] * 100)), int(round(a['phi'])))
             if k not in uniq:
                 uniq[k] = a
         actions = list(uniq.values())
+        actions = sorted(actions, key=lambda x: self._action_prior(x), reverse=True)
         actions = actions[:max(1, int(self.max_candidates))]
         if len(actions) == 0:
             actions.append(self._random_action())
@@ -190,6 +228,18 @@ class MCTSProAgent(Agent):
         off_term = 1.0 - float(np.clip((abs(float(act.get('a', 0.0))) + abs(float(act.get('b', 0.0)))) / 0.02, 0.0, 1.0))
         prior = float(np.clip(0.4 * v_term + 0.4 * ang_term + 0.2 * off_term, 0.0, 1.0))
         return prior
+    def _risk_penalty(self, shot, table, act):
+        pen = 0.0
+        pockets = [p.center[0:2] for p in table.pockets.values()]
+        cue_pos = shot.balls['cue'].state.rvw[0][0:2]
+        for pc in pockets:
+            d = float(np.linalg.norm(cue_pos - pc))
+            if d < 0.09 and shot.balls['cue'].state.s != 4:
+                pen += 12.0
+                break
+        v0 = float(act.get('V0', 0.0))
+        pen += float(max(0.0, (v0 - 2.2))) * 6.0
+        return pen
 
     def _evaluate_next(self, shot, last_state_snapshot, my_targets, table):
         new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state_snapshot[bid].state.s != 4]
@@ -249,6 +299,7 @@ class MCTSProAgent(Agent):
                     raw_reward = analyze_shot_for_reward(shot, last_state_snapshot, my_targets)
                     reach = self._future_reach(shot, my_targets)
                     raw_reward += float(self.lambda_future) * float(reach) * 15.0
+                    raw_reward -= self._risk_penalty(shot, table, act)
                     rewards.append((raw_reward, reach))
                 raw_mean = float(np.mean([r for r, _ in rewards]))
                 normalized_reward = (raw_mean - (-500.0)) / 650.0
