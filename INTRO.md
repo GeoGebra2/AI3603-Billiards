@@ -1,36 +1,72 @@
-# AI3603-Billiards 新智能体 NewAgent 介绍文档
+# AI3603-Billiards MCTSProAgent 介绍文档
 
 ## 概述
-- 本项目在不修改 `poolenv.py` 的前提下实现并接入 `NewAgent`，与课程提供的 `BasicAgent` 进行对战评估。
-- `NewAgent` 采用启发式候选生成 + 物理仿真评估 + 局部微调的策略，在可复现的设置下追求稳定的进球与低犯规。
+- 本项目在不修改 `poolenv.py` 的前提下实现并接入 `MCTSProAgent`，与课程提供的 `BasicAgent` 进行对战评估。
+- `MCTSProAgent` 采用 **蒙特卡洛树搜索 (MCTS)** 结合 **物理仿真** 的策略，通过启发式候选生成、鲁棒性仿真评估以及前瞻性价值估计，在可复现的设置下追求稳定的进球与低犯规。
 
 ## 算法设计
-- 候选生成：基于台面状态，选择距离白球最近的若干目标球，按从白球到目标球的几何方向生成若干角度与速度组合，并叠加轻微杆头偏移组合。
-- 物理仿真评估：对每个候选动作使用 `pooltool` 仿真，记录事件并依据项目内置评分函数进行打分。
-- 评分函数：使用 `agent.py` 中的 `analyze_shot_for_reward`，综合进己方球、合法黑 8、犯规项与防守因素。
-- 局部微调：对初筛最高分动作在角度与速度附近做小范围微调，进一步提升得分与鲁棒性。
-- 终局策略：当己方球清空后自动切换目标为黑 8。
+
+### 1. 候选动作生成 (Candidate Generation)
+- **目标选择**：优先选择当前合法的目标球（距离白球最近的若干个），若己方球清空则选择黑 8。
+- **几何启发**：
+  - 计算 **Ghost Ball** 位置：基于目标球和袋口位置，反推白球击打点。
+  - **遮挡检测**：检测白球到 Ghost Ball 路径 (`_occluded_cg`) 以及 Ghost Ball 到袋口路径 (`_occluded_tp`) 是否存在障碍球。
+- **参数扰动**：
+  - 对每个可行角度，生成不同的力度 (`V0`)、击球角度微调 (`phi`) 和杆法偏移 (`a`, `b`)。
+  - 包含基于距离的力度自适应 (`V_req`) 和角度搜索范围自适应。
+- **兜底策略**：若无有效候选，生成指向目标球中心的直球或随机安全球。
+
+### 2. MCTS 搜索策略
+- **Selection (选择)**：使用 UCB (Upper Confidence Bound) 公式选择最有潜力的候选动作节点。
+  - `c_puct`: 平衡探索 (Exploration) 与利用 (Exploitation)。
+- **Expansion & Evaluation (扩展与评估)**：
+  - **物理仿真**：使用 `pooltool` 对选定动作进行仿真。为提高鲁棒性，仿真时引入高斯噪声 (`sim_noise`) 模拟执行误差。
+  - **多样本评估**：对同一动作进行多次带噪仿真 (`robust_samples`)，取平均回报，降低偶然性影响。
+- **Reward Function (回报函数)**：
+  - **基础回报**：调用 `analyze_shot_for_reward` 计算进球、犯规等基础分。
+  - **未来收益 (`_future_reach`)**：评估击球后白球位置对剩余目标球的可达性，鼓励走位。
+  - **风险惩罚 (`_risk_penalty`)**：惩罚白球进袋风险高或力度过大的危险击球。
+  - **前瞻价值 (`_evaluate_next`)**：对仿真后的局面进行一步 Lookahead 搜索，评估下一杆的最佳期望得分（Gamma 衰减）。
+- **Backpropagation (反向传播)**：更新节点的访问次数 `N` 和总回报 `Q`。
+
+### 3. 动作先验 (Action Prior)
+- 在 MCTS 初始化阶段，根据启发式规则（如力度偏差、角度偏差、杆法偏移量）计算动作的先验概率，引导搜索优先探索更合理的动作。
 
 ## 代码结构与改动
-- `agent.py`：新增并实现 `NewAgent`，核心方法 `decision(balls, my_targets, table)` 输出动作参数 `V0, phi, theta, a, b`。
-- `evaluate.py`：默认使用 `agent_b = NewAgent()`，执行 40 局对战并输出统计结果。
-- `utils.py`：当前未使用，可作为后续通用工具的扩展位置。
+- `agents/new_agent.py`：
+  - **`MCTSProAgent`**：核心类，继承自 `Agent`。
+  - `decision(balls, my_targets, table)`：主入口，执行 MCTS 流程。
+  - `generate_candidate_actions(...)`：生成候选动作列表。
+  - `_simulate_with_timeout(...)`：带超时控制的并行物理仿真。
+  - `_evaluate_next(...)`：下一状态的快速评估。
+- `evaluate.py`：配置 `agent_b = MCTSProAgent()`，执行对战评估。
 
 ## 使用指南
-- 环境：建议 Python 3.10+，按项目指南执行 `pip install -r requirements.txt`。
-- 评估：在项目根目录运行 `python evaluate.py`，脚本将进行 40 局循环轮换对战并输出最终统计分数与胜率。
-- 依赖：需安装 `pooltool`（包含在 `requirements.txt` 中）。如缺失依赖，请先完成安装再运行评估脚本。
+- **环境依赖**：需安装 `pooltool` 及 `numpy`。
+- **运行评估**：
+  ```bash
+  python evaluate.py
+  ```
+  脚本将默认进行 40 局对战（可修改 `n_games`），输出胜率统计。
 
 ## 参数与可调项
-- 候选规模：目标球数量上限、角度扰动集合、速度候选集合、杆头偏移集合。
-- 微调范围：角度与速度的微小扰动、偏移微调集合。
-- 以上参数在 `NewAgent` 构造函数中配置，可按训练阶段做网格/贝叶斯搜索优化。
+在 `MCTSProAgent.__init__` 中可调整关键参数：
+- **搜索参数**：
+  - `n_simulations`: MCTS 迭代次数 (默认 60)。
+  - `c_puct`: UCB 探索系数 (默认 1.25)。
+  - `robust_samples`: 单次评估的仿真采样数 (默认 4)。
+- **物理参数**：
+  - `sim_noise`: 仿真噪声标准差 (V0, phi, theta, a, b)。
+  - `rollout_timeout`: 仿真超时时间。
+- **策略参数**：
+  - `lambda_future`: 走位奖励权重。
+  - `gamma_next`: 下一步价值的折扣因子。
 
 ## 评估与结果
-- 评分脚本：`evaluate.py`，胜负统计与胜率计算见项目规则说明。
-- 为获得稳定结果，请确认依赖安装完备；如需更快验证，可减小对战局数进行快速测试，正式评分按 40 局执行。
+- 相比基础 Agent，MCTSProAgent 在进球稳定性、防守能力和解球成功率上有显著提升。
+- 建议在评估时关注胜率以及平均单局得分。
 
 ## 后续改进建议
-- 结合 MCTS 或 RL（PPO/SAC）进一步提升策略与长远规划能力。
-- 基于数据驱动优化评分权重与候选参数范围。
-- 加入安全球与解球的特定模式，提高在复杂局面的稳定性。
+- **并行化优化**：利用 GPU 或多进程进一步加速 MCTS 仿真。
+- **价值网络**：训练神经网络替代 `_evaluate_next` 进行更深层的价值评估。
+- **对手建模**：在树搜索中加入对敌方策略的预测，进行 Minimax 风格的博弈规划。
